@@ -1,0 +1,30 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local virtual environment
+.venv/
+venv/
+
+# Runtime output produced by the app (CSV exports, local S3 stand-in)
+runtime/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Terraform state and local provider data (keep *.tf files tracked)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+.DS_Store

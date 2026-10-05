@@ -1,0 +1,13 @@
+services:
+  product-api:
+    build: ./mock-services/product-api
+    container_name: challenge-product-api
+    ports: ["8001:8000"]
+    environment:
+      PRODUCT_API_KEY: challenge-product-key
+  warehouse-api:
+    build: ./mock-services/warehouse-api
+    container_name: challenge-warehouse-api
+    ports: ["8002:8000"]
+    environment:
+      WAREHOUSE_API_KEY: challenge-warehouse-key
