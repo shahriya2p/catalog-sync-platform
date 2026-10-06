@@ -1,192 +1,192 @@
-# Architecture: PIM → WMS Daily Catalogue Sync
+# How the product sync works
 
-This document describes the **target** architecture and the reasoning behind it. Where the local implementation differs from the target, `UNFINISHED.md` says so.
+
+This describes the **planned production design**. Parts that are built and tested locally are marked as such in section 14. What is not built yet is listed in [UNFINISHED.md](UNFINISHED.md).
 
 ---
 
+## 1. The problem
 
-## 1. Problem in one paragraph
+Every morning, the company copies its full product list from the **PIM** (the system where products are described) into the **WMS** (the warehouse system that stores stock and product details).
 
-Every morning the catalogue is copied from the PIM (paginated, 10 req/s, page size ≤ 500, transient 429/5xx) into the WMS (batches ≤ 100, 20 req/s, per-record business rejections, no idempotency key). The catalogue is ~250k products now and ~1M within 18 months. The run must normally finish within 30 minutes, must recover from transient failures without manual steps, must never send the same product twice, must keep the raw export for 90 days, and must let operations tell whether a run is running, completed, or failed.
+- The product list used to be under 10,000 products. It is now about **250,000**, and is expected to reach about **1 million** within 18 months.
+- The copy must normally finish within **30 minutes**.
+- Temporary failures must recover on their own, without someone stepping in.
+- **The same product must never be sent to the warehouse twice.**
+- The original export of each day must be kept for **90 days**.
+- Operations must be able to tell, at any moment, whether a run is still going, finished, or failed.
 
-## 2. Capacity arithmetic (drives every other decision)
+## 2. The numbers that shape the design
 
-| Quantity | Value | Consequence |
+| What | Limit | What it means |
 |---|---|---|
-| PIM max throughput | 10 req/s × 500 = 5,000 products/s | 1M products ≥ 200 s of pure fetch time |
-| WMS max throughput | 20 req/s × 100 = 2,000 products/s | 1M products ≥ 500 s of pure delivery time |
-| 30-minute budget | 1,800 s | Delivery at 1M uses ~28% of the budget at the WMS rate limit; at 250k it uses ~7% |
-| Mean PIM latency | 100 ms – 3 s | At 10 req/s and 3 s latency, ~30 requests must be in flight to keep the limit saturated |
-| Mean WMS latency | "varies significantly" | Same reasoning; bounded concurrency is needed to hide latency |
+| PIM speed limit | 10 requests per second, 500 products each | At most 5,000 products per second. 1 million products take at least about 200 seconds just to read. |
+| WMS speed limit | 20 requests per second, 100 products each | At most 2,000 products per second. 1 million products take at least about 500 seconds (8 to 9 minutes) just to send. |
+| Time allowed | 30 minutes (1,800 seconds) | At 1 million products, sending uses about 28% of that time at the WMS speed limit. At 250,000, about 7%. |
+| PIM response time | 0.1 to 3 seconds | Many requests have to be in progress at once to keep up with the speed limit. |
+| WMS response time | Varies a lot | Same idea. The system must not wait for one request before starting the next. |
 
-Two consequences:
+Two rules follow from these numbers:
 
-1. **Rate limiting must be a shared, process-wide token bucket**, not `time.sleep` in each worker. Otherwise N workers each believe they own 10 req/s.
-2. **Retries consume the budget.** A 429 costs a request slot. The retry policy must be bounded and must not re-fetch or re-send work that already succeeded, or the 30-minute target is lost at 1M.
+1. **All the workers share one speed limit.** If each worker simply waits its own turn, ten workers would together send ten times the allowed speed. The system counts requests across all workers so the total stays under the limit.
+2. **Retries use up the speed limit too.** Every retry is a request, so retries must be limited. Otherwise a run that hits many temporary errors would miss the 30-minute target.
 
-At 1M products, the theoretical floor is ~8–9 minutes. The 30-minute target therefore tolerates roughly 3× slowdown from throttling and latency. That is the design margin.
+At 1 million products, the fastest possible run takes about 8 to 9 minutes. The 30-minute target leaves room for the system to run about three times slower than ideal because of throttling and slow responses.
 
-## 3. Architecture at a glance
+## 3. The big picture
 
 ![Architecture diagram](docs/architecture.png)
 
-*Rendered from [`docs/architecture.mmd`](docs/architecture.mmd) (Mermaid source; open [`docs/architecture.html`](docs/architecture.html) in a browser to re-render). The three planes are: control (EventBridge, Step Functions), extraction (PIM to S3), and delivery (SQS, worker, WMS, DynamoDB ledger).*
+*The diagram source is [docs/architecture.mmd](docs/architecture.mmd). To redraw it, open [docs/architecture.html](docs/architecture.html) in a browser.*
 
-**Read the diagram as three planes:**
+Think of the system as three parts that only pass messages to each other. None of them reaches into another part's memory. That means any part can be restarted without breaking the others.
 
-- **Control plane**: EventBridge and Step Functions. Owns run lifecycle, ordering, timeouts, and final status. Holds no product data.
-- **Extraction plane**: PIM page fetcher writes immutable raw pages to S3. Its output is durable before any delivery begins.
-- **Delivery plane**: SQS-fed workers send batches to WMS, rate-limited, and record the outcome of every SKU in a ledger.
+- **Control (the manager):** starts the daily run, keeps track of its steps, sets time limits, and reports the final result. It never touches product data.
+- **Download (the reader):** reads every product page from the PIM and saves each page as a file in storage before anything else happens.
+- **Upload (the sender):** takes the saved pages, sends the products to the WMS in small groups, and records what happened to each product.
 
-The planes communicate only through S3 objects, DynamoDB rows, and SQS messages. No plane calls into another's memory. This is what makes each one independently retryable.
+## 4. The parts and why each one is there
 
-## 4. Components
-
-| Component | Responsibility | Why this shape |
+| Part | What it does | Why it is this way |
 |---|---|---|
-| **EventBridge schedule** | Triggers one run per day. | Native, no server to run. |
-| **Step Functions (Standard)** | Owns the run state machine: stages, timeouts, retries of whole stages, final status. | Gives a visual execution history for operators, which answers "is it running, done, or failed?" without custom tooling. Standard (not Express) because runs last up to ~1 hour and need durable history. |
-| **Page fetcher** (one ECS Fargate task) | Fetches every PIM page with a bounded thread pool, writes each raw page to S3, checkpoints each one in DynamoDB. | Idempotent per page: a page already stored is skipped. A single task also means the PIM token bucket is exact rather than divided (§7). |
-| **S3 `raw/{run_id}/pages/`** | Immutable copy of every PIM page as received. | Replay source if transformation or delivery is wrong. Retained 90 days. |
-| **S3 `exports/{run_id}/`** | `catalogue.csv` assembled from the raw pages, plus `manifest.json` (page count, product count, PIM-reported total, SHA-256 of CSV). | Keeps the existing CSV contract that downstream tooling expects. The manifest is the completeness check. |
-| **DynamoDB `runs`** | One item per run: status, stage, counters, timestamps, `schema_version`. | Operators query it; the status command reads it. |
-| **DynamoDB `pages`** | One item per `(run_id, page)`: status, product count, checksum, object key. | A resume re-fetches only pages that are missing or failed. |
-| **SQS batch queue + DLQ** | Carries batch descriptors `(run_id, batch_no, sku_range or key list)`. | Decouples delivery rate from fetch speed. Visibility timeout > worst-case batch duration. DLQ catches poison messages. |
-| **Delivery worker** (Lambda or ECS) | Reads a batch, applies WMS rate limiting, POSTs to WMS, interprets partial success, updates the ledger. | Concurrency limited by reserved concurrency (Lambda) or service desired count (ECS), sized so that `workers × 100 products / latency ≤ 2,000/s`. |
-| **DynamoDB `ledger`** | One item per product per run: state, batch_no, attempt count, last reason, content hash. | The duplicate-protection record. Conditional writes make state transitions monotonic. Keyed by the single hash key `"<run_id>#<sku>"`, **not** `(run_id, sku)`: a composite key would send a million writes to one partition, which is capped at 1,000 WCU/s and would throttle delivery. Access is point read/write only, and `BatchGetItem`'s 100-key limit happens to match one WMS batch exactly. |
-| **DynamoDB `exceptions`** | Only rejected, unknown and locally-invalid products, keyed `(run_id, sku)`. | Aggregates come from counters on the run item, so nothing ever scans the ledger. This small, sparse table is what lets operations list "everything that went wrong in this run" with one query instead of a global secondary index over a million items. |
-| **CloudWatch** | Custom metrics, dashboard, alarms → SNS. | Standard, zero infrastructure. |
+| **Daily timer** | Starts one run each morning. | Built into AWS. Nothing to maintain. |
+| **Run manager** (AWS Step Functions) | Runs the steps in order, waits for them, handles time limits, and shows a visual history of each run. | Answers "is it running, done or failed?" without custom tools. It is for the run as a whole, not for each product. |
+| **Page reader** (one container task) | Reads every PIM page, saves it, and notes in a database that the page is saved. | Safe to restart: a page that is already saved is skipped. One task means the PIM speed limit is counted exactly. |
+| **Raw page storage** (S3) | A copy of every PIM page exactly as received. | If the later steps have a bug, we can run them again from these copies without asking the PIM again. Kept for 90 days. |
+| **Export storage** (S3) | The CSV file built from the raw pages, plus a `manifest.json` that lists how many products were in it and a fingerprint of the file. | The manifest is the proof that nothing is missing. |
+| **Run record** (DynamoDB) | One record per run: its status, its current step, its counts and its times. | Operators check this to see the status of a run. |
+| **Page record** (DynamoDB) | One record per saved page. | After a failure, only the missing pages are read again. |
+| **Work queue** (SQS) with a dead-letter queue | Holds one message per saved page, telling a sender which page to send. | Lets the sending speed be set separately from the reading speed. The dead-letter queue catches messages that keep failing so they do not block the rest. |
+| **Sender** (Lambda) | Reads a page, groups products into batches of 100, applies the WMS speed limit, sends them, and records each product's result. | Several senders can run at once, each with a fair share of the WMS speed limit. |
+| **Product ledger** (DynamoDB) | One record per product per run: where it is in the process, how many times it was tried, and the last reason. | This is what stops a product being sent twice. |
+| **Exceptions table** (DynamoDB) | Only the products that were rejected, could not be confirmed, or were invalid. | Gives operations one list of "what went wrong in this run" without searching the whole ledger. |
+| **Monitoring** (CloudWatch) | Counts, a dashboard, and alarms that send alerts. | Built into AWS. |
 
-### Why Step Functions *and* SQS
+### Why use both the run manager and the queue?
 
-Step Functions manages the **run** (a few dozen state transitions). SQS manages the **work** (~10,000 batch messages at 1M products). Putting 10,000 batches into a state machine's history would hit its limits and make the execution unreadable. Putting the run lifecycle into SQS would lose ordering and the operator view. Each tool does the job it is built for.
+The run manager handles the **run**: about a few dozen steps a day. The queue handles the **work**: about 10,000 batches for 1 million products. Putting 10,000 batches into the run manager would make its history unreadable and hit its limits. Putting the run steps into the queue would lose the simple status view. Each tool does what it is built for.
 
-## 5. Execution flow
+## 5. What happens during a run, step by step
 
-1. **StartRun**: create the run record with status `RUNNING`. The `run_id` is a UTC timestamp plus a short random suffix (`20261005T0931Z-3f9c`), so runs sort chronologically, a run is tied to its business date, and a manual re-run never collides with the scheduled one. Creation is a conditional write, so the same id cannot be started twice; the CLI says to use `resume` instead.
-2. **ExportPages**: a single ECS task (`ecs:runTask.sync`, so the state machine waits rather than polls) fetches every page with a bounded thread pool. For each page it skips the fetch if the page is already recorded `COMPLETE` **and** still present in S3, otherwise it fetches, writes the raw page, and only then records the checkpoint. Writing storage before the checkpoint is deliberate: a crash in between makes the page look unfetched and it is simply fetched again, whereas the reverse order could mark a page complete that is not in storage.
-   The page count is not known in advance. Page 1 is fetched first because its response carries `total`, from which `N = ceil(total / page_size)` follows.
-3. **BuildManifest**: the same task then streams the stored pages in order into `exports/{run_id}/catalogue.csv` and writes `manifest.json` with the row count, the PIM's reported total, the SHA-256 of the CSV, and the list of failed pages. The manifest is the completeness record: `complete` is false when a page is missing or the row count does not match, and the run is reported `PARTIAL` rather than silently short.
-4. **EnqueuePages**: sends **one SQS message per stored raw page**, not per batch. A page message is a few bytes and the worker reads one small object; a batch message would otherwise have to carry a row range into a CSV that is hundreds of megabytes at a million products. Each page of 500 products becomes five WMS batches of 100 inside the worker, and the batch numbers are derived from the page's global row offset so they are identical to the numbers the local CSV-streaming path produces. That identity is what lets both execution models share one ledger and one batch table; it holds because the PIM only ever returns a short page as the last page. A re-enqueue is harmless: the ledger and `claim_batch`, not the queue, decide what may be sent.
-5. **WaitForDelivery**: a `Wait` state plus a check function, looping until no batch is left `PENDING`, `SENDING` or `FAILED_TRANSIENT`, bounded by the state machine timeout.
-6. **Finalize**: `COMPLETED` when every product reached a definite outcome; `PARTIAL` when anything is missing or ambiguous (failed pages, failed batches, any `UNKNOWN`, or an incomplete export); `FAILED` when no usable export was produced. Business rejections are always reported but do not by themselves make a run unsuccessful — the warehouse told us exactly what it thinks of those products.
-7. **Reconcile** is **not** part of the scheduled flow. It is an operator command that resends only `UNKNOWN` products, and only with explicit confirmation, because it is the one operation that can create a real duplicate (§8).
+1. **Start.** A run record is created with status *running*. Each run has an ID made of the date, the time and a short random code, for example `20261005T0931Z-3f9c`. This means runs sort by date, and a manual re-run never clashes with the scheduled one. If the same ID is started twice, the system refuses and tells the operator to use "resume" instead.
+2. **Read all the pages.** One task reads every page from the PIM. Before it reads a page, it checks whether that page is already saved. If it is, the page is skipped. Each page is saved to storage first, and only then is it marked as saved. If the task crashes in between, the page looks unsaved and is simply read again. The other order could mark a page as saved when it is not.
+   The total number of pages is not known at the start. The first page response says how many products there are in total, and that gives the number of pages.
+3. **Build the CSV and manifest.** The saved pages are joined, in order, into one CSV file. A manifest records the product count, the total the PIM reported, a fingerprint of the file, and any pages that failed. If a page is missing, or the count does not match, the manifest says the export is incomplete, and the run is marked *partial*. It is never quietly short.
+4. **Queue the work.** One message is queued per saved page, not per batch. A page message is tiny. A message per batch would have to point into a file that can be hundreds of megabytes. Each page of 500 products becomes five batches of 100 inside the sender. Queuing again is harmless, because the ledger decides what can be sent.
+5. **Wait for the senders to finish.** The run manager checks, at intervals, that no batch is still waiting, being sent, or waiting to be retried. It stops at the time limit.
+6. **Final result.**
+   - **Completed:** every product has a clear outcome.
+   - **Partial:** something is missing or unclear: a failed page, a failed batch, a product with an unknown outcome, or an incomplete export.
+   - **Failed:** no usable export was produced.
 
-### Data flow
+   Products rejected by the warehouse are reported but do not make a run partial. The warehouse has already said clearly what it thinks of those products.
+7. **Resolve unknowns (only by hand).** There is a separate operator command, `reconcile`, that re-sends only products with an unknown outcome. It only runs with an explicit confirmation flag, because re-sending is the one step that can create a real duplicate. It is never part of the daily run.
+
+### Data flow in one picture
 
 ```
-PIM /products ──► raw page JSON ──► S3 raw/{run}/pages/000001.json …
-                                         │
-                                         ▼
-                        CSV + manifest ──► S3 exports/{run}/catalogue.csv, manifest.json
-                                         │
-                                         ▼
-                    SQS batch messages ──► worker ──► WMS /products/batch
-                                         │
-                                         ▼
-                      DynamoDB ledger: PENDING → SENT → ACCEPTED | REJECTED | UNKNOWN
+PIM products ──► raw page files ──► S3: raw/{run}/pages/
+                                        │
+                                        ▼
+                  CSV + manifest ──► S3: exports/{run}/catalogue.csv, manifest.json
+                                        │
+                                        ▼
+                  queue messages ──► sender ──► WMS
+                                        │
+                                        ▼
+                  ledger: PENDING → SENT → ACCEPTED, REJECTED or UNKNOWN
 ```
 
-The CSV is a **view** of the raw pages. The raw pages are the source of truth. This is deliberate: if the transform changes, we re-derive the CSV without re-calling the PIM.
+The CSV is **a view of the raw pages**, not the original. The raw pages are the source of truth. If the way the CSV is built changes, we rebuild it from the raw pages without asking the PIM again.
 
-## 6. Failure and retry flow
+## 6. When things go wrong
 
-### Error classes and handling
-
-| Observed outcome | Class | Action |
+| What happened | What it means | What the system does |
 |---|---|---|
-| PIM 429 | Known, transient, not processed | Wait `Retry-After` if present, else exponential backoff with full jitter. Return the token to the bucket only after the wait. |
-| PIM 5xx, timeout | Known-or-unknown; reads are safe to repeat | Retry the page. Reads have no side effects, so a repeat cannot double anything. |
-| PIM 4xx other than 429 (e.g. 401, 400) | Permanent | Fail the page immediately, no retry. A 401 fails the whole run, because it means a configuration problem. |
-| WMS 429 | Known, not processed | Same backoff. Ledger state does not change. |
-| WMS 503 | Known to be a server rejection | Same backoff. The current docs do not say whether 503 means "not processed"; see the duplicate analysis in §8 for how this is handled. |
-| WMS 400, 413 | Permanent, not processed | Do not retry. Mark the batch's items `FAILED_VALIDATION` and surface them. This is a bug in our payload, not a transient issue. |
-| WMS 200 with `accepted` + `rejected` | Partial success | Mark `accepted` SKUs `ACCEPTED`, `rejected` SKUs `REJECTED` with reason. **Never retry accepted items.** Rejects are not retried automatically; they need a data fix. |
-| WMS 200 but a SKU appears in neither list | Ambiguous | Mark `UNKNOWN`. Do not treat as accepted. |
-| WMS timeout or connection reset after the request was sent | **Ambiguous** | Mark the batch's still-`SENT` items `UNKNOWN`. Do not auto-resend. See §8. |
-| Worker crash mid-batch | Ambiguous | SQS redelivers. Items already `ACCEPTED`/`REJECTED` are skipped by the ledger; items `SENT` without an outcome become `UNKNOWN` after the visibility timeout. |
+| PIM says "slow down" (429) | Temporary. Nothing was processed. | Waits as long as the PIM asks, or backs off with a random wait, then tries again. |
+| PIM server error (5xx) or timeout | Temporary. Reading has no side effects, so trying again is safe. | Tries the page again. |
+| PIM says the request is wrong (400, 401) | Permanent. Retrying will not help. | Fails that page right away. A "not allowed" (401) answer stops the whole run, because it means the setup is wrong. |
+| WMS says "slow down" (429) | Temporary. Nothing was processed. | Same backing off. The product states do not change. |
+| WMS server error (503) | Probably temporary. We do not know for sure whether the warehouse processed it. | Backs off and tries again. See the duplicate section (8) for why this is an assumption. |
+| WMS says the request is wrong (400, 413) | Our data or request is wrong. Retrying will not help. | Does not retry. Marks those products as failed validation and reports them. This is a bug to fix, not a temporary problem. |
+| WMS answers with a list of accepted and rejected products | Partial success. This is normal. | Accepted products are marked done and are **never sent again**. Rejected products get their reason recorded and are not retried, because retrying a rejection cannot succeed. |
+| A product is in neither the accepted nor the rejected list | We do not know what happened to it. | Marked *unknown*. Never treated as accepted. |
+| The connection drops after the request was sent | We do not know whether the warehouse processed it. | Marks the products *unknown* and does **not** send them again automatically. See section 8. |
+| The sender crashes in the middle of a batch | Same situation as above. | The message is delivered again later. Products already accepted or rejected are skipped. Products left in *sent* with no answer become *unknown*. |
 
-### Retry policy (applies to both APIs)
+### Retry rules (used for both the PIM and the WMS)
 
-- Exponential backoff with **full jitter**: `sleep = random(0, min(cap, base × 2^attempt))`, `base = 0.5 s`, `cap = 30 s`, `max_attempts = 6` per request.
-- `Retry-After` overrides the computed sleep if it is larger.
-- Retries happen **inside** the request loop, so the rate limiter sees each attempt as one token.
-- After `max_attempts`, the page or batch is marked failed for this attempt. The message goes back to SQS (with a visibility delay), up to `maxReceiveCount = 5`, then to the DLQ.
+- Each retry waits a random time that grows with each attempt, up to 30 seconds. The random part spreads retries out, so many workers do not all retry at the same moment.
+- If the PIM or WMS says how long to wait, that wait is used if it is longer.
+- After 6 attempts on one request, that page or batch is marked failed for this round. The message goes back into the queue to try again later. After 5 rounds, it moves to the dead-letter queue for a person to look at.
+- Each attempt, including retries, counts against the speed limit.
 
-Why full jitter: with a deterministic mock failing on every 11th and 13th request, synchronised backoff would cause thundering-herd retries at the same moment. Jitter spreads them.
+### A note on the supplied test servers
 
-### A note on the supplied mocks
+The supplied PIM and WMS test servers have a bug: when they mean to send "slow down" or "unavailable", they actually send a generic server error with no wait time. Because of this, the local tests cover the general retry path, not the specific "slow down" path. The "slow down" path is covered by separate unit tests instead. The test servers were not changed, as the brief asks.
 
-Both mock services intend to return 429 and 503 but construct `JSONResponse(429, {...})` with the status and body transposed, so their throttling paths actually surface as **HTTP 500 with no `Retry-After` header**. The mocks are part of the test environment and were not modified. Two consequences, both deliberate:
+## 7. Speed and the speed limits
 
-- the client treats the whole 5xx family as "not processed, retry", which is also the documented behaviour of the real APIs, so it copes with either;
-- `Retry-After` handling cannot be exercised against the mock, so it is covered by unit tests with an injected transport ([`tests/test_product_api.py`](tests/test_product_api.py)).
+### How the speed limit is counted
 
-This is worth stating because it changes what the local run proves: it proves the retry path, not the throttling-specific path.
+- The PIM and WMS each have one counter, shared by all the threads that talk to them. The counter lets 10 requests per second through to the PIM and 20 to the WMS.
+- A request that arrives when the counter is empty waits its turn. Requests are served in the order they arrived.
+- Retries count as requests, so they use up the limit too.
 
-## 7. Scaling and rate limiting
+**In AWS, the WMS limit is split between workers, not shared.** The page reader is a single task, so its counter is exact. The senders run as separate Lambda functions that cannot see each other's counters. So each sender gets a fixed share of the limit, based on how many can run at once. This is safe, because the total never goes over the limit. But if only a few senders are running, the run is slower than it needs to be. A proper shared counter is the next thing to build (see [UNFINISHED.md](UNFINISHED.md)). It is not built yet, so this document does not claim it exists.
 
-### Rate limits
+Adding more senders does not make the run faster by itself. The WMS speed limit is the real ceiling.
 
-A token bucket ([`app/clients/rate_limiter.py`](app/clients/rate_limiter.py)) is shared by every thread that talks to a given API: 10 tokens/s for the PIM, 20 for the WMS, burst equal to the rate. A caller that finds the bucket empty takes its slot anyway (the balance goes negative) and waits for its own deficit, which keeps the long-run rate exact and serves callers in arrival order instead of waking them all at once.
+### How the run time grows
 
-Two properties matter and are tested with an injected clock:
-
-- **Every attempt takes a token, including retries.** A retry is a request; if it bypassed the bucket, a throttled run would breach the limit exactly when the API is already complaining.
-- **One bucket per API, not per worker.** Eight fetcher threads sleeping `1/rate` each would produce eight times the allowed rate. The original script's fixed `time.sleep(1)` retry wocluld have become this bug as soon as it ran with concurrency.
-
-**In AWS the budget is divided, not shared.** The exporter is a single ECS task, so its in-process bucket is the whole PIM budget and is exact. The delivery workers are separate Lambda invocations that cannot see each other, so Terraform gives each one `wms_requests_per_second / delivery_worker_concurrency` and caps reserved concurrency; the fleet therefore stays inside 20 req/s, at the cost of under-using the budget when fewer workers are active. A genuinely shared distributed limiter (a DynamoDB token bucket with short leases) is the next step and is listed in [UNFINISHED.md](UNFINISHED.md); it is not implemented, so this document does not claim it.
-
-Delivery concurrency is deliberately not the control: at 3 s WMS latency roughly 60 in-flight requests would be needed to saturate 20 req/s, so the limiter binds first and concurrency only decides how much of the budget is reachable.
-
-### Scaling 250k → 1M
-
-| Stage | 250k | 1M | Bottleneck |
+| Step | 250,000 products | 1 million products | What limits it |
 |---|---|---|---|
-| Fetch | 500 pages ≈ 50 s at 10 rps | 2,000 pages ≈ 200 s | PIM rate limit |
-| CSV build | streamed, seconds | streamed, minutes at most | S3 read throughput, not a constraint |
-| Delivery | 2,500 batches ≈ 125 s | 10,000 batches ≈ 500 s | WMS rate limit |
-| Total (ideal) | ~3 min | ~12 min | |
-| Total with throttling and retries (assume 20% overhead) | ~4 min | ~15 min | Within 30 min |
+| Read from the PIM | about 50 seconds | about 200 seconds | PIM speed limit |
+| Build the CSV | a few seconds | a few minutes at most | Storage speed, not a real limit |
+| Send to the WMS | about 125 seconds | about 500 seconds | WMS speed limit |
+| Total, ideal | about 3 minutes | about 12 minutes | |
+| Total, with about 20% extra for retries and slowness | about 4 minutes | about 15 minutes | Well within 30 minutes |
 
-The design scales linearly with product count because **nothing holds the whole catalogue in memory**: pages are written to S3 as they arrive, the CSV is streamed from those pages, and delivery works through a bounded in-flight window. The original script held every product in one list, which would have needed roughly 1–2 GB of Python objects at a million products and lost everything on any failure.
+The design grows in a straight line with the number of products because **the system never holds the whole product list in memory**. Pages are saved to storage as they arrive, the CSV is built from those saved pages, and the sender works through a limited number of batches at a time. An earlier version held every product in one list. At 1 million products that would have needed about 1 to 2 GB of memory, and a single failure would lose everything.
 
-## 8. Partial failures and duplicate protection
+These are estimates from arithmetic. They have not been measured at this size. See section 15.
 
-This is the hardest requirement: *"The same product must never be sent twice."* We treat it as a business requirement and, as the brief asks, we do not assume its technical meaning is complete. We distinguish four cases.
+## 8. Partial failures and duplicates
 
-### 8.1 Four cases
+The business rule is: *the same product must never be sent twice.* The warehouse does not state what this means exactly, so we split it into four cases.
 
-| # | Case | What happens | Guarantee we give |
+### 8.1 The four cases
+
+| # | Case | What happens | What we guarantee |
 |---|---|---|---|
-| 1 | **Application-level idempotency**: the same run or re-enqueued batch is processed again | The ledger is keyed by `(run_id, sku)`. A transition `SENT → ACCEPTED` is a conditional write; a re-processed item sees a terminal state and is skipped. | **Strong.** Within our system, a SKU in a terminal state is never re-sent for the same run. |
-| 2 | **Retry after a known failure** (WMS returned 429, 503, 400, or 413) | The item was not accepted. We record the attempt, and resend. For 400/413 we do not resend (payload bug). | **Strong** for 429 and 400/413 under the assumption that these mean "not processed". 503 is treated the same way, under an explicit assumption (§8.3). |
-| 3 | **Ambiguous network timeout** after the request was sent | WMS may or may not have accepted the batch. We mark items `UNKNOWN` and do **not** auto-resend. | **We cannot prove the product was not sent**, but we also do not double-send. Items are visible and must be reconciled explicitly. |
-| 4 | **Cross-run duplication** (tomorrow's run sends a SKU already sent today) | This is expected by the business: the catalogue is a daily full sync. It is an *update*, not a duplicate. | Requirement is ambiguous here. We assume "never twice in a run" and that WMS upserts by SKU (§10, A3). |
+| 1 | The same product is processed again in the same run, for example after a restart. | The ledger records each product's state. Moving a product from *sent* to *accepted* only happens if its state is still the earlier one. A product already in a final state is skipped. | **Strong.** Within our system, a product that reached a final state in a run is never sent again in that run. |
+| 2 | The warehouse said "not processed" (429, 503, 400, 413) and we try again. | We record the attempt and send again. For 400 and 413 we do not send again, because the data is wrong. | **Strong** for 429 and 400/413, if "not processed" is what those answers mean. 503 depends on an assumption (section 8.3). |
+| 3 | The connection timed out after the request was sent. | The warehouse may or may not have processed it. We mark the products *unknown* and do **not** send them again automatically. | We cannot prove the product was not sent. We also do not send it twice. These products are visible and need a deliberate decision. |
+| 4 | Tomorrow's run sends a product that was sent today. | This is expected. The catalogue is a daily full copy, so it is an update, not a duplicate. | "Never twice" means never twice within one run. We assume the warehouse updates a product when it gets the same product code again. |
 
-### 8.2 What the WMS API does and does not give us
+### 8.2 What the warehouse API gives us, and what it does not
 
-- No idempotency key header or field.
-- No documented behaviour for a repeated SKU within the same batch or across batches. The supplied mock was checked directly: sending the same SKU twice in one batch returns it twice in `accepted`, so **the WMS has no duplicate protection of its own**. Everything therefore rests on the ledger.
-- No documented status for a request that timed out.
-- No read endpoint, so we cannot ask the WMS what it holds.
+- It has **no way to say "I already have this request"**. There is no idempotency key, which is a unique ID that makes repeat requests safe.
+- It does not say what happens if the same product code appears twice in one batch or across batches. We checked the test server: sending the same product twice in one batch returns it twice as accepted. So **the warehouse does not stop duplicates itself. Our ledger has to.**
+- It does not say what it does with a request that timed out.
+- It has **no way to ask what it already holds**, so we cannot check before we resend.
 
-Therefore **case 3 cannot be fully closed from our side.** The honest options:
+This means **case 3 cannot be fully closed from our side**. There are three possible fixes:
 
-1. **Preferred (requires WMS change)**: an `Idempotency-Key` header (`run_id:batch_no`), where the WMS stores the outcome for 24 h and returns it on a repeat. With this, case 3 becomes a safe retry and the guarantee is strong end to end. The client **already sends this header** ([`app/clients/warehouse_api.py`](app/clients/warehouse_api.py)); today the WMS ignores it, so it buys nothing, but the day the warehouse team implements it no client change is needed. Sending a header the server ignores is not a guarantee, and this document does not count it as one.
-2. **Without a WMS change (implemented design)**: keep `UNKNOWN` as a visible, bounded state. Alarm on any `UNKNOWN > 0`. Provide a `reconcile` operation that re-sends only `UNKNOWN` items, and only when an operator sets an explicit flag. The residual risk is a small number of duplicated SKUs equal to the number of timed-out batches whose request actually reached WMS.
-3. **Reconciliation via WMS query** (if WMS offers a read endpoint by SKU or run tag): query before resending. Not available in the mock; listed in `UNFINISHED.md`.
+1. **Best option, needs a change by the warehouse team:** an `Idempotency-Key` header, a unique ID per batch. The warehouse stores the result for 24 hours and returns the same result on a repeat. With this, case 3 becomes a safe retry. Our client already sends this header. The warehouse ignores it today, so it gives no protection yet. The day they support it, no change on our side is needed. A header the server ignores is not a guarantee, and this document does not count it as one.
+2. **What is built now, no warehouse change needed:** keep *unknown* as a visible, limited state. Raise an alarm whenever there are any unknown products. Provide a `reconcile` command that re-sends only unknown products, and only with an explicit flag. The remaining risk is a few duplicates, at most one per timed-out batch whose request actually reached the warehouse.
+3. **Ask the warehouse for a read endpoint:** check before re-sending. Not available today. Listed in [UNFINISHED.md](UNFINISHED.md).
 
-### 8.3 Assumptions behind the claims
+### 8.3 Assumptions behind these claims
 
-- **A1**: A 429 response means the request was **not processed**. Basis: the documented semantics of 429. If false, case 2 becomes case 3 for 429s.
-- **A2**: A 503 response means the request was **not processed**. This is weaker than A1 and is the first assumption to challenge with the Warehouse team.
-- **A3**: Within one run, a SKU appearing in two batches is a bug and the second send is a duplicate. Across runs, a SKU update is expected.
-- **A4**: A 200 response is authoritative for every SKU it names in `accepted` or `rejected`.
+- **A1:** A 429 answer means the request was **not processed**. If this is false, case 2 becomes case 3 for 429 answers.
+- **A2:** A 503 answer means the request was **not processed**. This is weaker than A1 and is the first assumption to check with the warehouse team.
+- **A3:** Within one run, the same product appearing in two batches is a bug. Across runs, a repeat is expected as an update.
+- **A4:** A 200 answer is correct for every product it names as accepted or rejected.
 
-### 8.4 Partial success, concretely
+### 8.4 A partial success, concretely
 
-WMS returns HTTP 200 with:
+The warehouse answers "OK" but with two lists:
 
 ```json
 {"accepted": ["P0000001", "P0000002"],
@@ -194,134 +194,146 @@ WMS returns HTTP 200 with:
  "message": "Processed"}
 ```
 
-Note that `accepted` is a list of bare strings, while `rejected` is a list of objects. The parser must handle both shapes and must not assume they cover the whole batch. Any batch SKU not in either list becomes `UNKNOWN`.
+The accepted list is plain codes. The rejected list has a code and a reason. The reader must handle both shapes and must not assume the two lists cover the whole batch. Any product that is in neither list becomes *unknown*.
 
-Successful products are never in the retry set. A batch of 100 with 1 rejection causes 1 ledger write to `REJECTED` and 99 to `ACCEPTED`, not a re-send of 100.
+Accepted products are never sent again. A batch of 100 with one rejection updates one product to *rejected* and 99 to *accepted*. None are sent again.
 
-A rejection can also arrive as `{"sku": null, "reason": "sku is required"}`, which cannot be attributed to a product. Rather than guess, the client counts it, logs it and leaves the affected SKUs `UNKNOWN`; the delivery stage avoids creating these in the first place by validating every row locally before sending it, so a product with no SKU is recorded as `FAILED_VALIDATION` against its row instead of becoming an untraceable warehouse rejection.
+A rejection can also come back with no product code, for example `{"sku": null, "reason": "sku is required"}`. We cannot tell which product that is, so we do not guess. We count it, log it, and leave the affected products as *unknown*. Before sending, every row is checked locally, so a product with no code is recorded as a failed validation against its row. It never reaches the warehouse as an unexplained rejection.
 
-### 8.5 How the ordering of writes makes a crash detectable
+### 8.5 Why the order of writes matters
 
-The ledger entry is written as `SENT` **before** the request goes out, which is what turns a crash into evidence:
+The ledger records a product as *sent* **before** the request goes out. This is what makes a crash visible:
 
-1. `register_batch` → `claim_batch` (conditional: only `PENDING` or `FAILED_TRANSIENT` can be claimed, so a redelivered SQS message or a second worker stops here).
-2. filter out SKUs already in a terminal ledger state (this is what makes a resume send only what is missing).
-3. `mark_sent` the remainder.
-4. send; apply the per-SKU outcome.
+1. Claim the batch. Only a batch that is waiting or waiting to retry can be claimed, so a repeated message or a second sender stops here.
+2. Skip products already in a final state. This is what lets a resumed run send only what is missing.
+3. Mark the remaining products as *sent*.
+4. Send the batch, and record each product's result.
 
-If the process dies between 3 and 4, the batch is left `SENDING` and its SKUs `SENT` with no outcome. On the next pass `reclaim_stale_batches` moves the batch to `UNKNOWN` and the delivery stage marks those SKUs `UNKNOWN` — never `PENDING`, because the request may already have been applied. That behaviour is tested directly in [`tests/test_warehouse_sync.py`](tests/test_warehouse_sync.py) (`test_a_batch_interrupted_mid_flight_becomes_unknown`).
+If the process dies between steps 3 and 4, the products are left as *sent* with no result. On the next pass they become *unknown*, never *waiting*. The request may already have been applied, so they must not be sent again automatically. This is tested directly in [tests/test_warehouse_sync.py](tests/test_warehouse_sync.py).
 
-## 9. AWS service choices
+## 9. Which AWS services and why
 
-| Need | Service | Reason rejected alternatives |
+| What we need | Service | Why this one |
 |---|---|---|
-| Schedule | EventBridge Scheduler | Cron on EC2 would need a host to operate. |
-| Run orchestration | Step Functions Standard | Airflow/MWAA is heavier to operate for one daily job. Hand-rolled coordinator loses execution history. |
-| Compute: export | ECS Fargate task | The export of a million products runs for minutes and must not be cut off by Lambda's 15-minute ceiling. |
-| Compute: delivery and control | Lambda (container image) | Many short independent units of work; reserved concurrency is the cleanest cap on the request rate against the WMS. |
-| Packaging | **One image for both**, dispatched by the entrypoint | Two artefacts would mean two builds, two scans and the possibility of the two execution paths running different code. |
-| Raw and export storage | S3 with versioning, SSE-KMS, 90-day lifecycle on `raw/` and `exports/` | Required by brief. Lifecycle is enforced by bucket rule, not code. |
-| Run state, page checkpoints, SKU ledger | DynamoDB on-demand | Needs conditional writes and single-digit-ms reads at ~1M keys. RDS would add connection management for no benefit. |
-| Work queue | SQS standard + DLQ | Standard (not FIFO) because we enforce ordering through the ledger, and FIFO's 300 msg/s limit would throttle the 10k-batch enqueue. |
-| Secrets | Secrets Manager | API keys are rotated outside the repo; never in code or tfvars. |
-| Observability | CloudWatch metrics, alarms, dashboard; SNS for paging | No extra vendor. |
-| Infrastructure | Terraform | Required by brief. |
+| Daily timer | EventBridge Scheduler | Needs no server to run. |
+| Run steps and history | Step Functions (Standard) | Shows the history of each run in a visual page. A simpler tool would not keep that history. Airflow is heavier to run for one daily job. |
+| Reading pages | ECS Fargate task | Reading a million products can take many minutes. Lambda stops after 15 minutes, so it is not used here. |
+| Sending batches and run steps | Lambda (container image) | Many short, separate pieces of work. Limiting how many run at once is the simplest way to limit the speed sent to the WMS. |
+| Packaging | One image for both | Two images would mean two builds and the risk that they run different code. |
+| Raw pages and exports | S3, with versioning, encryption and a 90-day rule | Required by the brief. The 90-day rule is enforced by the storage itself, not by our code. |
+| Run status, page records, product ledger | DynamoDB (pay per request) | Fast lookups and safe conditional updates. A relational database would add connection work for no benefit. |
+| Work queue | SQS (standard) with a dead-letter queue | Standard, not FIFO. The order is enforced by the ledger. FIFO's limit of 300 messages per second would slow down the 10,000 batch messages. |
+| Passwords and API keys | Secrets Manager | Keys are changed outside the code and are never stored in code or configuration files. |
+| Monitoring | CloudWatch (metrics, alarms, dashboard), SNS for alerts | Built into AWS. No extra vendor. |
+| Infrastructure as code | Terraform | Required by the brief. |
 
-## 10. Security and IAM
+## 10. Security and access
 
-- **Least privilege per role**: separate roles for the exporter task, the delivery worker, the control-plane functions, the state machine and the scheduler ([`infra/terraform/iam.tf`](infra/terraform/iam.tf)). Each is scoped to specific bucket prefixes, tables and queue ARNs.
-- **The split is chosen to bound mistakes**: the exporter can write `raw/` and `exports/` but cannot call the WMS or touch the ledger; the delivery worker can read `raw/` and write the ledger but has **no S3 write permission at all**, so a bug in delivery cannot corrupt the 90-day export. No role is granted `s3:DeleteObject` — retention is a lifecycle rule, not an application capability.
-- **Secrets**: PIM and WMS API keys live in Secrets Manager. Workers read them at cold start with an IAM condition on the secret ARN. Keys are never in environment variables in plain text, never in Terraform state (we reference the secret, not the value), and never in the repo. `.gitignore` already excludes `.env*` and `*.tfvars`.
-- **S3**: public access blocked at account and bucket level; SSE-KMS with a customer-managed key; versioning on; TLS-only bucket policy; lifecycle expiry at 90 days.
-- **Data classification**: the catalogue is commercial but not personal data. No PII is in scope. Logs must not contain full product payloads; they log counts, SKUs only at `DEBUG`, and never API keys.
-- **Network**: Lambdas in a VPC with NAT for outbound calls to PIM and WMS, or with a fixed egress IP if the partners allowlist IPs. VPC endpoints for S3 and DynamoDB to keep that traffic off NAT.
-- **Transport**: HTTPS only to PIM and WMS; certificate verification on (httpx default).
+- **Each part has its own permissions.** The page reader, the sender, the control functions, the run manager and the timer each have a separate role. Each role can only reach the storage, tables and queues it needs ([infra/terraform/iam.tf](infra/terraform/iam.tf)).
+- **The permissions are set to limit mistakes.** The page reader can write the raw pages and exports, but cannot send to the warehouse or change the ledger. The sender can read the raw pages and write to the ledger, but **has no permission to write to storage at all**. A bug in sending therefore cannot damage the 90-day export. Nothing has permission to delete files. Expiry is done by the storage's own rule.
+- **Keys and passwords** are stored in Secrets Manager and read when the function starts. They are never in code, in configuration files that go to git, or in plain environment variables. The repository already ignores `.env` files and `*.tfvars` files.
+- **Storage** blocks all public access, encrypts files with a managed key, keeps old versions, only accepts secure connections, and deletes files after 90 days.
+- **Data type:** the product data is commercial, not personal. No personal data is in scope. Logs record counts and product codes for rejections and unknowns. They never contain full product records or keys.
+- **Network:** the functions run inside a private network, and reach the PIM and WMS through a fixed outgoing address if the partners need an allow list. Traffic to S3 and DynamoDB stays inside AWS.
+- **Connections** to the PIM and WMS use HTTPS, and the certificates are checked.
 
-## 11. Observability
+## 11. Monitoring
 
-### Metrics (CloudWatch, namespace `CatalogueSync`; no `RunId` dimension, to keep cardinality low)
+### The numbers we track
 
-- extraction: `PimRequests`, `PimRetries`, `Pim429`, `Pim5xx`, `PagesFetched`, `PagesFailed`, `PagesSkippedAlreadyStored`, `ProductsExported`
-- delivery: `WmsRequests`, `WmsRetries`, `Wms429`, `Wms5xx`, `Wms413`, `WmsBatchesSent`, `BatchesSkipped`, `WmsAmbiguousOutcomes`
-- outcomes: `ProductsAccepted`, `ProductsRejected`, `ProductsUnknown`, `ProductsFailedValidation`
-- timing and run level: `RunDurationSeconds`, `ExportDurationSeconds`, `DeliveryDurationSeconds`, `RunsCompleted`, `RunsPartial`, `RunsFailed`
+The metrics are kept in a single namespace called `CatalogueSync`. Run IDs are not used as labels, to keep costs low.
 
-Metrics are accumulated in process and flushed once per stage, either as a plain JSON log line locally or in CloudWatch Embedded Metric Format in AWS ([`app/observability.py`](app/observability.py)), so the same counters serve both without an extra API call per metric. `PagesSkippedAlreadyStored` deserves a mention: it is how an operator sees that a resume really did avoid re-fetching work.
+- **Reading:** requests to the PIM, retries, "slow down" answers, server errors, pages read, pages failed, pages skipped because they were already saved, products exported.
+- **Sending:** requests to the WMS, retries, "slow down" answers, server errors, batches sent, batches skipped, unknown outcomes.
+- **Outcomes:** products accepted, rejected, unknown, failed validation.
+- **Time and status:** run duration, reading duration, sending duration, runs completed, partial and failed.
+
+The counts are gathered during each step and written out once per step. Locally they go to the log as a line of JSON. In AWS they go to CloudWatch in a format it reads directly, so one set of counters serves both. The `PagesSkippedAlreadyStored` count shows that a resumed run really did avoid downloading the same pages again.
 
 ### Logs
 
-- Structured JSON, one line per event, with `run_id`, `stage`, `page` or `batch_no`, `attempt`, and `outcome`.
-- Correlation: the `run_id` is propagated in SQS message attributes and Step Functions input.
-- Log levels: `INFO` for stage transitions and per-batch outcome counts; `WARN` for retries; `ERROR` for permanent failures. No product-level logging except SKUs for rejects and unknowns.
+- Each log line is one event in JSON, with the run ID, the step, the page or batch number, the attempt number, and the outcome.
+- The run ID travels with every queue message, so one run can be followed from start to finish.
+- Normal steps are logged as information. Retries are warnings. Permanent failures are errors. Product codes are logged only for rejections and unknowns.
 
 ### Alarms
 
-| Alarm | Condition | Why |
+| Alarm | When it fires | Why |
 |---|---|---|
-| Run failed | Step Functions execution `FAILED` or `TIMED_OUT` | The run did not complete. |
-| Run late | No `COMPLETED` by 30 min after scheduled start | Business SLA breached. |
-| Unknowns present | `ProductsUnknown > 0` at Finalize | Duplicate risk needs an operator decision. |
-| Partial run | `PagesFailed > 0` or rejects above threshold | Data incomplete. Threshold to be set after a baseline. |
-| DLQ depth | `ApproximateNumberOfMessagesVisible > 0` on DLQ | Poison batches. |
-| Throttling pressure | `Pim429 + Wms429` above baseline for 10 min | Early warning that a partner is slowing us down. |
+| Run failed | The run stops with an error or times out | The run did not finish. |
+| Run late | No completed run within 30 minutes of the scheduled start | The business deadline has been missed. |
+| Unknown products | Any unknown products at the end of a run | Someone needs to decide what to do. |
+| Partial run | Failed pages, or too many rejections | The data is incomplete. The threshold is set after a baseline is measured. |
+| Dead-letter queue has messages | Any message in it | Something keeps failing. |
+| Too many "slow down" answers | A high count for 10 minutes | An early warning that a partner is slowing us down. |
 
-### Operator view
+### What an operator sees
 
-`python -m app.main status <run_id>` (local) and the Step Functions execution page (AWS) answer the brief's question: running, completed, or failed, with counts.
+`python -m app.main status <run_id>` locally, and the run's page in Step Functions in AWS, show whether the run is running, completed, partial or failed, with the counts.
 
-## 12. Important trade-offs
+## 12. Trade-offs
 
-| Decision | Chosen | Alternative | Why | Cost of the choice |
+Every design choice has a cost. These are the main ones.
+
+| Decision | What we chose | The alternative | Why | What it costs us |
 |---|---|---|---|---|
-| Keep raw pages in S3 | Yes | Stream straight to WMS | Replay, audit, and recovery without re-hitting PIM | Storage cost grows with catalogue size (raw plus CSV per day), bounded by the 90-day lifecycle; size not yet measured |
-| CSV as derived view | Yes | CSV as source | Source of truth is the raw pages | Extra build step (minutes at 1M) |
-| Don't auto-resend `UNKNOWN` | Yes | Auto-retry on timeout | Avoids silent duplicates | Some SKUs need an operator; residual risk until WMS idempotency exists |
-| Shared DynamoDB token bucket | Yes | Per-worker sleep | Correct global rate | DynamoDB writes and a leasing scheme add complexity |
-| Step Functions + SQS | Yes | SQS only, or SFN only | Run view plus unbounded work queue | Two services to understand |
-| Standard SQS | Yes | FIFO | Throughput; ordering is enforced by the ledger | Duplicate deliveries possible; handled by the ledger |
-| Lambda + Fargate | Yes | ECS-only | Lambda for cost and speed; Fargate for >15 min tasks | Two packaging pipelines |
-| Full jitter backoff | Yes | Equal jitter or none | Spreads retries | Slightly less predictable run time |
-| Reject-but-don't-retry validation failures | Yes | Retry rejects | Retrying a validation failure wastes budget and cannot succeed | Data fixes need a separate process |
+| Keep raw pages | Yes | Send straight to the warehouse | We can replay and audit without asking the PIM again | Storage grows with the catalogue. It is limited by the 90-day rule, and the size has not been measured yet. |
+| CSV as a view | Yes | CSV as the original | The raw pages stay the source of truth | Building the CSV adds a few minutes at 1 million products. |
+| Never send *unknown* products again automatically | Yes | Retry on timeout | Avoids silent duplicates | Some products need a person to decide. This risk remains until the warehouse supports idempotency keys. |
+| Shared speed counter across workers | **Planned, not built.** Today the WMS limit is split between workers. | Split the limit (what we have) | The shared counter gives the exact limit and uses it fully | Added complexity, and more writes to the database. |
+| Run steps plus a queue | Yes | Queue only, or run steps only | A status view plus a queue with no size limit | Two services to understand. |
+| Standard queue | Yes | FIFO | Higher throughput. The ledger enforces the order. | Duplicate messages are possible. The ledger handles them. |
+| Lambda plus container task | Yes | Container tasks only | Lambda is cheap and fast for short work. The container task handles the long read. | Two ways to package the code. |
+| Random backoff | Yes | Fixed waits or no waits | Spreads retries out | Run times are a little less predictable. |
+| Do not retry rejected products | Yes | Retry them | Retrying a rejection cannot succeed, and it wastes the speed limit | Fixing bad data needs a separate process. |
 
-## 13. Assumptions and what would change them
+## 13. Assumptions, and what changes if they are wrong
 
-Each row follows the brief's four-part format: the issue, the assumption, its effect, and what changes if the assumption is wrong.
+Each row has four parts: the problem, the assumption we made, what that assumption affects, and what we would change if it turned out to be false.
 
-| # | Issue | Assumption | Effect | If the assumption is not valid |
+| # | Problem | Assumption | What it affects | What we would change if it is false |
 |---|---|---|---|---|
-| 1 | WMS duplicate guarantee is undefined | "Never twice" means never twice within one run; cross-run upsert is expected (A3) | Ledger is per run; daily updates are allowed | Scope the ledger to the SKU and content hash across runs, and add a "last delivered hash" check before every send |
-| 2 | WMS 503 semantics are unknown | 503 means not processed (A2) | 503 is retried like 429 | Treat 503 like a timeout: mark `UNKNOWN`. Costs more manual reconciliation |
-| 3 | No idempotency key in WMS | Cannot be added by us | Duplicate risk in ambiguous cases is bounded but not zero | Adopt the `Idempotency-Key` header (§8.2) |
-| 4 | PIM `total` is stable during a run | Catalogue does not change mid-export | Pages are consistent with one `total` | Use a snapshot or `updated_since` cursor; deltas are in `UNFINISHED.md` |
-| 5 | Daily full sync is acceptable | Full catalogue each day, not CDC | Simple, ~12–15 min at 1M | Move to delta sync using `updated_at` watermarks, which is the first scaling step after 1M |
-| 6 | Mock behaviour is representative | Deterministic 429/503 cadence is a fair proxy | Tests use it | Real jitter and latency change tuning, not the design |
-| 7 | 30-minute SLA is end-to-end | Includes fetch, build, and delivery | Stage budgets in §5 | If delivery must finish alone in 30 min, the budget still holds |
-| 8 | SKU is unique and stable | `id` from PIM is the WMS SKU | Ledger keyed on SKU | Key on a composite if the WMS uses a different key |
+| 1 | The warehouse does not define "never twice" | It means never twice in one run. Updating a product across runs is expected (A3). | The ledger is per run. Daily updates are allowed. | Track each product across runs, by its code and a fingerprint of its content, and check before every send. |
+| 2 | We do not know what a 503 means | A 503 means "not processed" (A2). | 503 is retried, the same as 429. | Treat 503 like a timeout and mark the products *unknown*. This means more manual checking. |
+| 3 | The warehouse has no idempotency key | We cannot add one ourselves. | Duplicates in unclear cases are limited, but not impossible. | Use the `Idempotency-Key` header once the warehouse supports it (section 8.2). |
+| 4 | The PIM total stays the same during a run | The catalogue does not change while it is being read. | Pages are consistent with one total. | Use a snapshot or a "changed since" cursor. Both are listed in UNFINISHED.md. |
+| 5 | A full copy every day is acceptable | We copy the whole catalogue each day, not just changes. | Simple. Takes about 12 to 15 minutes at 1 million. | Copy only changed products, using the PIM's "last updated" time. This is the first thing to do after 1 million. |
+| 6 | The test servers behave like the real ones | Their fixed pattern of errors is a fair stand-in. | The tests use it. | Real timing and errors change how we tune the system, not the design. |
+| 7 | The 30-minute target covers the whole run | It includes reading, building the CSV, and sending. | The time budget in section 5 applies. | If sending alone must take 30 minutes, the budget still holds. |
+| 8 | The PIM product ID is the warehouse product code | The `id` from the PIM is the warehouse's code. | The ledger uses this code. | Use a combined key if the warehouse uses a different one. |
 
-## 14. Implementation map
+## 14. What is built, and where
 
-Where each part of this document lives in the repository, and how much of it actually runs.
+This table shows where each part lives in the code, and whether it runs on a laptop or only in AWS.
 
-| Design element | Code | Runs locally? | Runs in AWS? |
+| Part | Code | Runs locally? | Runs in AWS? |
 |---|---|---|---|
-| Token bucket rate limiting | [`app/clients/rate_limiter.py`](app/clients/rate_limiter.py) | Yes, exactly | Exact for the single exporter task; **divided per worker** for delivery (§7) |
-| Classification, backoff, jitter, `Retry-After` | [`app/clients/retry.py`](app/clients/retry.py) | Yes | Yes |
-| PIM paging | [`app/clients/product_api.py`](app/clients/product_api.py) | Yes | Yes |
-| WMS batching, partial success, ambiguity | [`app/clients/warehouse_api.py`](app/clients/warehouse_api.py) | Yes | Yes |
-| Page checkpoints, streamed CSV, manifest | [`app/services/catalogue_export.py`](app/services/catalogue_export.py) | Yes | Yes |
-| Ledger, claim, resume, reconcile | [`app/services/warehouse_sync.py`](app/services/warehouse_sync.py) | Yes | Yes |
-| Run lifecycle and final status | [`app/services/runner.py`](app/services/runner.py) | Yes (in-process stages) | Yes (Step Functions calls the same code) |
-| Object storage | [`app/storage/`](app/storage/) | Local filesystem | S3 (`boto3`), tested with `moto` |
-| Run state | [`app/state/`](app/state/) | SQLite | DynamoDB, tested with `moto` against the same contract suite |
-| Queue fan-out | [`app/aws_handlers.py`](app/aws_handlers.py) | In-process dispatch instead | SQS |
-| Infrastructure | [`infra/terraform/`](infra/terraform/) | `validate` only | Not deployed |
+| Speed limiting | [app/clients/rate_limiter.py](app/clients/rate_limiter.py) | Yes, exactly | Exact for the page reader. **Split between senders** for the WMS (section 7). |
+| Deciding what to retry, waits, random backoff | [app/clients/retry.py](app/clients/retry.py) | Yes | Yes |
+| Reading PIM pages | [app/clients/product_api.py](app/clients/product_api.py) | Yes | Yes |
+| Batching, partial success, unknowns | [app/clients/warehouse_api.py](app/clients/warehouse_api.py) | Yes | Yes |
+| Saved page records, CSV, manifest | [app/services/catalogue_export.py](app/services/catalogue_export.py) | Yes | Yes |
+| Ledger, claiming, resume, reconcile | [app/services/warehouse_sync.py](app/services/warehouse_sync.py) | Yes | Yes |
+| Run steps and final status | [app/services/runner.py](app/services/runner.py) | Yes (steps run in one process) | Yes (Step Functions calls the same code) |
+| File storage | [app/storage/](app/storage/) | Local folder | S3, tested with a fake S3 (moto) |
+| Run state | [app/state/](app/state/) | SQLite database | DynamoDB, tested against the same checks as SQLite |
+| Queue handling | [app/aws_handlers.py](app/aws_handlers.py) | Runs in process instead of a queue | SQS |
+| Infrastructure | [infra/terraform/](infra/terraform/) | Checked, not deployed | Not deployed |
 
-The local runner replaces SQS with an in-process bounded work window. That is the one structural difference between the two execution models, and it is deliberate: it keeps the repository runnable with `python -m app.main run` while the batch, ledger and claim semantics - the parts that carry the correctness guarantees - are identical in both.
+The one real difference between the local run and AWS is the queue. Locally, the work is handled in one process with a limited number of batches at a time. The rules for batches, the ledger and claims are the same in both, and those rules are what keep products from being sent twice.
 
-## 15. What this document does not claim
 
-- **Not exactly-once delivery.** Exactly-once needs WMS-side idempotency (§8.2, option 1). What is implemented is: at-most-once per run in the success path, no automatic resend after an ambiguous outcome, and a bounded, visible, operator-owned `UNKNOWN` state for the residual cases.
-- **Not a verified 30-minute SLA at 1M products.** The arithmetic in §2 says it is achievable with roughly 3x margin, and the local run of 12,000 products completes in about 8 seconds, but the only proof is a load test against a realistic PIM and WMS. The mock catalogue is 12,000 products, so nothing here demonstrates behaviour at a million.
-- **Not a globally shared rate limiter in AWS.** See §7.
-- **Not deployed.** The Terraform is validated, not applied; no AWS account was used.
-- Remaining gaps, with risk and priority, are in [UNFINISHED.md](UNFINISHED.md).
+---
+
+## Glossary
+
+- **PIM:** Product Information Management. The system where products are described and maintained.
+- **WMS:** Warehouse Management System. The system that stores stock and product details for the warehouse.
+- **SKU:** a product's code, its unique identifier.
+- **Batch:** a group of 100 products sent to the WMS in one request.
+- **Idempotency key:** a unique ID sent with a request so that repeating the same request is safe.
+- **Ledger:** the record of what happened to each product in a run.
+- **Speed limit (rate limit):** the maximum number of requests allowed per second.
+- **Backoff:** waiting longer and longer between retries.
+- **Dead-letter queue:** where messages go after they keep failing, so a person can check them.
+- **Reconcile:** the manual step that re-sends products with an unknown outcome, after explicit confirmation.
