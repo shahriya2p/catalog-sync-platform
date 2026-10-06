@@ -1,0 +1,55 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  body { margin: 0; padding: 24px; background: #ffffff; font-family: Arial, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p { font-size: 13px; color: #444; margin: 0 0 12px; }
+  #diagram { width: 100%; }
+</style></head>
+<body>
+<h1>PIM to WMS catalogue sync: architecture</h1>
+<p>Daily run orchestrated by Step Functions. Raw pages and ledger are durable; delivery is rate limited and idempotent per product.</p>
+<div id="diagram"><pre class="mermaid">
+flowchart TB
+    EB["EventBridge Scheduler<br/>daily 02:00 UTC"] --> SFN
+
+    subgraph SFN["Step Functions: run state machine"]
+      direction LR
+      S0["StartRun"] --> S1["ExportPages<br/>ECS Fargate task"]
+      S1 --> S2["BuildManifest<br/>CSV + manifest"]
+      S2 --> S3["EnqueuePages<br/>1 message per page"]
+      S3 --> S4["WaitForDelivery"]
+      S4 --> S6["Finalize<br/>COMPLETED / PARTIAL / FAILED"]
+    end
+
+    PIM[("PIM API<br/>max 10 req/s<br/>page size 500")] <-- "GET /products" --> S1
+    S1 -- "raw page JSON" --> RAW[("S3 raw/run-id/pages<br/>KMS, 90-day lifecycle")]
+    S2 -- "CSV + manifest" --> EXP[("S3 exports/run-id<br/>KMS, 90-day lifecycle")]
+    S1 -. "page checkpoints" .-> DDB[("DynamoDB<br/>runs, pages")]
+
+    S3 --> Q[["SQS delivery queue"]]
+    Q -- "5 failed receives" --> DLQ[["SQS DLQ"]]
+    RAW -. "read one page" .-> W
+    Q --> W["Delivery worker<br/>Lambda, reserved concurrency"]
+    W -- "POST /products/batch<br/>100 products, max 20 req/s" --> WMS[("WMS API")]
+    W -- "conditional writes" --> LED[("DynamoDB<br/>ledger, batches, exceptions")]
+
+    S6 --> CW["CloudWatch<br/>metrics, dashboard"]
+    W --> CW
+    CW --> AL["Alarms<br/>run failed, late, UNKNOWN > 0, DLQ"] --> SNS["SNS to on-call"]
+
+    OP(["Operator"]) -. "reconcile, explicit flag only" .-> W
+    OP -. "status" .-> DDB
+
+    classDef store fill:#eef6ff,stroke:#3b6ea5
+    classDef compute fill:#f4f4f4,stroke:#555
+    classDef risk fill:#fff3e0,stroke:#c77700
+    class PIM,WMS,RAW,EXP,DDB,LED store
+    class S0,S1,S2,S3,S4,S6,W compute
+    class OP,AL,SNS risk
+</pre></div>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", flowchart: { curve: "basis", padding: 14 } });
+</script>
+</body></html>

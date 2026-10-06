@@ -1,0 +1,23 @@
+// Copy to terraform.tfvars (gitignored) and fill in for your account.
+// No secrets belong in this file: API keys are written straight into the
+// Secrets Manager secrets created by this module.
+
+aws_region  = "eu-west-1"
+environment = "prod"
+
+// Build and push the image first, then pin it by digest for reproducibility:
+//   docker build -t <account>.dkr.ecr.<region>.amazonaws.com/catalogue-sync-prod:1.0.0 .
+app_image_uri = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/catalogue-sync-prod:1.0.0"
+
+// Existing private subnets with outbound internet access, and a security group
+// allowing egress to the PIM and WMS.
+vpc_subnet_ids     = ["subnet-aaaaaaaa", "subnet-bbbbbbbb"]
+security_group_ids = ["sg-aaaaaaaa"]
+
+product_api_url   = "https://pim.internal.example.com"
+warehouse_api_url = "https://wms.internal.example.com"
+
+// 02:00 UTC daily.
+schedule_expression = "cron(0 2 * * ? *)"
+
+alarm_email = "supply-chain-oncall@example.com"

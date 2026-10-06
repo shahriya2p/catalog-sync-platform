@@ -133,7 +133,7 @@ A token bucket ([`app/clients/rate_limiter.py`](app/clients/rate_limiter.py)) is
 Two properties matter and are tested with an injected clock:
 
 - **Every attempt takes a token, including retries.** A retry is a request; if it bypassed the bucket, a throttled run would breach the limit exactly when the API is already complaining.
-- **One bucket per API, not per worker.** Eight fetcher threads sleeping `1/rate` each would produce eight times the allowed rate. The original script's fixed `time.sleep(1)` retry would have become this bug as soon as it ran with concurrency.
+- **One bucket per API, not per worker.** Eight fetcher threads sleeping `1/rate` each would produce eight times the allowed rate. The original script's fixed `time.sleep(1)` retry wocluld have become this bug as soon as it ran with concurrency.
 
 **In AWS the budget is divided, not shared.** The exporter is a single ECS task, so its in-process bucket is the whole PIM budget and is exact. The delivery workers are separate Lambda invocations that cannot see each other, so Terraform gives each one `wms_requests_per_second / delivery_worker_concurrency` and caps reserved concurrency; the fleet therefore stays inside 20 req/s, at the cost of under-using the budget when fewer workers are active. A genuinely shared distributed limiter (a DynamoDB token bucket with short leases) is the next step and is listed in [UNFINISHED.md](UNFINISHED.md); it is not implemented, so this document does not claim it.
 

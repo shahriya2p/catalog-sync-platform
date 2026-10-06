@@ -1,0 +1,37 @@
+flowchart TB
+    EB["EventBridge Scheduler<br/>daily 02:00 UTC"] --> SFN
+
+    subgraph SFN["Step Functions: run state machine"]
+      direction LR
+      S0["StartRun"] --> S1["ExportPages<br/>ECS Fargate task"]
+      S1 --> S2["BuildManifest<br/>CSV + manifest"]
+      S2 --> S3["EnqueuePages<br/>1 message per page"]
+      S3 --> S4["WaitForDelivery"]
+      S4 --> S6["Finalize<br/>COMPLETED / PARTIAL / FAILED"]
+    end
+
+    PIM[("PIM API<br/>max 10 req/s<br/>page size 500")] <-- "GET /products" --> S1
+    S1 -- "raw page JSON" --> RAW[("S3 raw/run-id/pages<br/>KMS, 90-day lifecycle")]
+    S2 -- "CSV + manifest" --> EXP[("S3 exports/run-id<br/>KMS, 90-day lifecycle")]
+    S1 -. "page checkpoints" .-> DDB[("DynamoDB<br/>runs, pages")]
+
+    S3 --> Q[["SQS delivery queue"]]
+    Q -- "5 failed receives" --> DLQ[["SQS DLQ"]]
+    RAW -. "read one page" .-> W
+    Q --> W["Delivery worker<br/>Lambda, reserved concurrency"]
+    W -- "POST /products/batch<br/>100 products, max 20 req/s" --> WMS[("WMS API")]
+    W -- "conditional writes" --> LED[("DynamoDB<br/>ledger, batches, exceptions")]
+
+    S6 --> CW["CloudWatch<br/>metrics, dashboard"]
+    W --> CW
+    CW --> AL["Alarms<br/>run failed, late, UNKNOWN > 0, DLQ"] --> SNS["SNS to on-call"]
+
+    OP(["Operator"]) -. "reconcile, explicit flag only" .-> W
+    OP -. "status" .-> DDB
+
+    classDef store fill:#eef6ff,stroke:#3b6ea5
+    classDef compute fill:#f4f4f4,stroke:#555
+    classDef risk fill:#fff3e0,stroke:#c77700
+    class PIM,WMS,RAW,EXP,DDB,LED store
+    class S0,S1,S2,S3,S4,S6,W compute
+    class OP,AL,SNS risk
