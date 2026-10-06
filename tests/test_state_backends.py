@@ -5,7 +5,7 @@ identically, because the duplicate-protection guarantees are expressed as
 conditional updates and it would be worthless to prove them only against the
 backend that never runs in production.
 
-The DynamoDB cases need moto (``pip install -r requirements-dev.txt``); they
+The DynamoDB cases need moto (``pip install -r requirements.txt``); they
 skip themselves if it is absent so the suite still passes without it.
 """
 
@@ -87,7 +87,7 @@ def backend(request, tmp_path):
         store.close()
         return
 
-    moto = pytest.importorskip("moto", reason="moto is only in requirements-dev.txt")
+    moto = pytest.importorskip("moto", reason="moto is only in requirements.txt")
     import boto3
 
     with moto.mock_aws():

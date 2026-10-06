@@ -20,7 +20,7 @@ def object_store(request, tmp_path):
         yield LocalObjectStore(str(tmp_path / "s3"))
         return
 
-    moto_s3 = pytest.importorskip("moto", reason="moto is only in requirements-dev.txt")
+    moto_s3 = pytest.importorskip("moto", reason="moto is only in requirements.txt")
     import boto3
 
     with moto_s3.mock_aws():

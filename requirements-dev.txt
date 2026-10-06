@@ -1,6 +1,0 @@
--r requirements.txt
-
-# AWS adapters (S3 and DynamoDB) are tested against moto rather than a real
-# account. The tests that need it skip themselves if it is not installed, so
-# `pytest` still passes with requirements.txt alone.
-moto[s3,dynamodb]==5.2.3

@@ -95,7 +95,7 @@ def test_enqueue_batches_requires_a_queue(tmp_path):
 
 
 def test_enqueue_batches_sends_one_message_per_stored_page(monkeypatch, tmp_path):
-    moto = pytest.importorskip("moto", reason="moto is only in requirements-dev.txt")
+    moto = pytest.importorskip("moto", reason="moto is only in requirements.txt")
     import boto3
 
     from app.state.sqlite_store import SqliteRunStateStore

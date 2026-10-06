@@ -20,12 +20,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Build tooling is needed only to install awslambdaric, so it is removed again
-# in the same layer.
-COPY requirements-app.txt ./
+# Only the runtime packages are installed: pytest, moto and the mock-service
+# dependencies in requirements.txt stay out of the image. Build tooling is
+# needed only to install awslambdaric, so it is removed again in the same layer.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libc-dev \
-    && pip install --no-cache-dir -r requirements-app.txt awslambdaric==3.1.1 \
+    && pip install --no-cache-dir httpx==0.28.1 boto3==1.37.18 awslambdaric==3.1.1 \
     && apt-get purge -y gcc libc-dev \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

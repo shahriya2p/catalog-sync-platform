@@ -1,5 +1,0 @@
-# Runtime dependencies of the application itself (what goes in the image).
-# The local/dev extras (FastAPI, uvicorn, pytest, moto) live in
-# requirements.txt and requirements-dev.txt and are not shipped.
-httpx==0.28.1
-boto3==1.37.18

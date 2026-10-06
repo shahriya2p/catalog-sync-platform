@@ -23,7 +23,7 @@ docker compose up --build -d          # PIM on :8001, WMS on :8002
 # 2. Install
 python -m venv .venv
 source .venv/bin/activate             # Windows: .venv\Scripts\activate
-pip install -r requirements-dev.txt   # or requirements.txt to skip the AWS test deps
+pip install -r requirements.txt
 
 # 3. Test
 pytest
@@ -162,7 +162,7 @@ What the suite is actually asserting:
 | Backend parity | the state contract passes identically on SQLite and on DynamoDB (moto) |
 | AWS adapters | S3 object store against moto; SQS page fan-out; the SQS worker reports per-message failures |
 
-`moto` (in `requirements-dev.txt`) is only needed for the AWS adapter tests;
+`moto` (in `requirements.txt`) is only needed for the AWS adapter tests;
 they skip themselves if it is absent, so `pytest` passes with
 `requirements.txt` alone.
 

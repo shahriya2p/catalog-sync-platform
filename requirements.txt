@@ -1,8 +1,11 @@
 # Local development and test environment.
 # fastapi/uvicorn are only needed to run the supplied mock services (and to
 # drive them in-process from the tests); they are not application dependencies.
+# moto is only needed for the AWS adapter tests, which skip themselves if it is
+# absent, so pytest still passes without it.
 fastapi==0.115.6
 uvicorn==0.34.0
 httpx==0.28.1
 boto3==1.37.18
 pytest==8.3.5
+moto[s3,dynamodb]==5.2.3
